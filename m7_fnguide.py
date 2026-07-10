@@ -1,24 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-m7_fnguide.py (v3) — FnGuide 컨센서스 주간 스냅샷 수집기
-=========================================================
+m7_fnguide.py (v4) — FnGuide 컨센서스 주간 스냅샷 수집기 (브라우저 렌더링판)
+==========================================================================
 목적: 컨센서스(영업이익 추정치)는 과거 소급이 불가능하므로
       매주 스냅샷을 찍어 리비전 시계열을 직접 축적한다.
 부수입: WICS 업종 분류가 같이 수집되어 산업→종목 매핑테이블이 된다.
 
-v3 변경점 (v2 대비):
-- 세션 워밍업 + 쿠키 유지: 세션 없는 접근을 기본 페이지(삼성전자)로
-  돌려보내는 서버 동작에 대응
-- 페이지코드 검증: 응답 페이지의 종목코드가 요청과 다르면 재시도,
-  계속 다르면 'redirected'로 집계하고 오염 데이터 저장 방지
-- 연간 컨센서스 표를 div id가 아니라 내용으로 탐지
-  (thead에 (E) 컬럼 + tbody에 영업이익 행 + 기간 간격 12개월)
-- 진단 강화: 실패 시 요청/응답 코드 불일치 여부, 영업이익 표를 품은
-  div id 목록, html 내 '(E)' 출현 횟수까지 출력
+v4 변경점 (v3 대비):
+- FnGuide가 JS 앱으로 전환됨(서버는 빈 껍데기만 반환)을 확인 →
+  requests 대신 Playwright 헤드리스 크롬으로 렌더링 완료 후 수집
+- 요청 종목코드와 '(E)' 텍스트가 화면에 나타날 때까지 대기 후 파싱
+- 이미지/폰트/미디어 로딩 차단으로 속도 2배 확보
+- 파서는 v3의 내용 기반 연간표 탐지를 그대로 재사용
 
 스키마(long): run_date, code, name, wics, metric, period, value
   metric = op_e(영업이익 추정, 억원) / rev_e(매출액 추정, 억원) / target_price(원)
-실행: GitHub Actions 주간 cron 또는 로컬에서 `python m7_fnguide.py`
+실행: GitHub Actions 주간 cron 또는 로컬 `python m7_fnguide.py`
+      (로컬은 사전 1회: pip install playwright && playwright install chromium)
 """
 import os
 import re
@@ -27,25 +25,15 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
 
 KST = timezone(timedelta(hours=9))
 TODAY = datetime.now(KST).strftime("%Y-%m-%d")
 TOP_N = int(os.environ.get("M7_TOP_N", "300") or "300")
-SLEEP = float(os.environ.get("M7_SLEEP", "0.7"))
+SLEEP = float(os.environ.get("M7_SLEEP", "0.3"))
 OUT_DIR = os.path.join("data", "m7_revision")
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-    "Referer": "https://comp.fnguide.com/",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
 
 
 def log(msg):
@@ -92,40 +80,36 @@ def get_universe_safe() -> pd.DataFrame:
         raise
 
 
-# ---------------------------------------------------------------- fetch
-def _pagecode(html: str) -> str:
-    """페이지 상단(title 근처)에서 실제 표시 중인 종목코드 추출."""
-    m = re.search(r"\((A?\d{6})\)", html[:3000])
-    return m.group(1).lstrip("A") if m else ""
+# ---------------------------------------------------------------- browser
+def _new_page(ctx):
+    page = ctx.new_page()
+    # 이미지/폰트/미디어 차단 (속도)
+    page.route("**/*", lambda route: route.abort()
+               if route.request.resource_type in ("image", "font", "media")
+               else route.continue_())
+    return page
 
 
-def warmup():
-    """세션 쿠키 확보용 선행 접속."""
+def fetch(page, code: str):
+    """렌더링 완료된 html 반환. (html or None, status ok/slow/fail)"""
     try:
-        SESSION.get(_url("005930"), timeout=15)
-        time.sleep(1.0)
-    except requests.RequestException:
-        pass
-
-
-def fetch(code: str):
-    """반환: (html or None, status)  status ∈ ok / redirected / fail"""
-    last_mismatch = None
-    for _ in range(3):
-        try:
-            r = SESSION.get(_url(code), timeout=15)
-            if r.status_code == 200 and len(r.text) > 5000:
-                if _pagecode(r.text) == code:
-                    return r.text, "ok"
-                last_mismatch = r.text
-                time.sleep(1.5)
-                continue
-        except requests.RequestException:
-            pass
-        time.sleep(2)
-    if last_mismatch is not None:
-        return last_mismatch, "redirected"
-    return None, "fail"
+        page.goto(_url(code), timeout=25000, wait_until="domcontentloaded")
+    except Exception:  # noqa: BLE001
+        return None, "fail"
+    status = "ok"
+    try:
+        page.wait_for_function(
+            "() => { const t = document.body.innerText;"
+            f" return (t.includes('({code})') || t.includes('A{code}'))"
+            " && t.includes('(E)'); }",
+            timeout=15000,
+        )
+    except Exception:  # noqa: BLE001
+        status = "slow"   # 조건 미충족이어도 일단 내용은 받아서 파싱 시도
+    try:
+        return page.content(), status
+    except Exception:  # noqa: BLE001
+        return None, "fail"
 
 
 # ---------------------------------------------------------------- parse
@@ -137,6 +121,11 @@ def _clean_num(s: str):
         return float(s)
     except ValueError:
         return None
+
+
+def _pagecode(html: str) -> str:
+    m = re.search(r"\((A?\d{6})\)", html[:5000])
+    return m.group(1).lstrip("A") if m else ""
 
 
 def _extract_wics(soup: BeautifulSoup) -> str:
@@ -167,7 +156,7 @@ def _row_labels(tbody) -> list:
 
 def _find_annual_table(soup: BeautifulSoup):
     """div id에 의존하지 않고 연간 컨센서스 표를 내용으로 탐지.
-    조건: thead 마지막 행에 (E) 컬럼 존재 + tbody에 '영업이익' 행 존재.
+    조건: thead 마지막 행에 (E) 컬럼 + tbody에 '영업이익' 행.
     복수 후보면 기간 간격이 12개월(연간)인 표를 우선."""
     fallback = None
     for table in soup.find_all("table"):
@@ -195,8 +184,7 @@ def _find_annual_table(soup: BeautifulSoup):
 
 
 def _annual_estimates(soup: BeautifulSoup) -> dict:
-    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원.
-    반환: {("op_e","2026/12"): 12345.0, ...}"""
+    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원."""
     out = {}
     table, periods = _find_annual_table(soup)
     if table is None:
@@ -212,11 +200,8 @@ def _annual_estimates(soup: BeautifulSoup) -> dict:
         if not metric:
             continue
         vals = cells[1:]
-        # 헤더-값 정렬: 헤더 행에 라벨 칸이 포함된 구조(1줄 thead)면 한 칸 밀기
-        if len(periods) == len(vals) + 1:
-            pers = periods[1:]
-        else:
-            pers = periods
+        # 헤더에 라벨 칸이 포함된 1줄 thead 구조면 한 칸 밀기
+        pers = periods[1:] if len(periods) == len(vals) + 1 else periods
         for i, p in enumerate(pers):
             if "(E)" not in p or i >= len(vals):
                 continue
@@ -243,70 +228,81 @@ def parse(code: str, name: str, html: str) -> list:
 
 
 def _diagnose(req_code: str, html: str):
-    """수집이 전멸일 때 원인 판별용 상태 출력."""
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else "(no title)"
     page = _pagecode(html)
-    mismatch = " (불일치 -> 세션/봇감지 의심)" if page and page != req_code else ""
+    mismatch = " (불일치)" if page and page != req_code else ""
     log(f"[diag] 요청코드={req_code} 페이지코드={page or '?'}{mismatch}")
     log(f"[diag] len={len(html)} title='{title[:60]}' "
         f"tables={len(soup.find_all('table'))}")
-    ids = sorted({d.get("id") for d in soup.find_all("div", id=True)
-                  if d.find("table") and "영업이익" in d.get_text()})
-    log(f"[diag] '영업이익' 표를 품은 div id: {ids[:10] if ids else '없음'}")
     log(f"[diag] html 내 '(E)' {html.count('(E)')}회 / "
-        f"'영업이익' {html.count('영업이익')}회 "
-        f"(둘 다 많은데 수집 0이면 코드 문제, '(E)'가 0이면 값이 JS 지연로딩)")
+        f"'영업이익' {html.count('영업이익')}회")
 
 
 # ---------------------------------------------------------------- main
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     uni = get_universe_safe()
-    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s")
-    warmup()
+    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s (browser)")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("[error] playwright 미설치: pip install playwright && "
+            "playwright install chromium")
+        sys.exit(1)
 
     all_rows = []
-    n_ok = n_empty = n_fail = n_redirect = n_parse_err = 0
+    n_ok = n_empty = n_fail = n_slow = 0
     last_html, last_code = None, ""
     diagnosed = False
 
-    for i, row in uni.iterrows():
-        code, name = str(row["Code"]), str(row["Name"])
-        html, status = fetch(code)
-        if status == "fail":
-            n_fail += 1
-        elif status == "redirected":
-            n_redirect += 1
-            last_html, last_code = html, code
-        else:
-            last_html, last_code = html, code
-            try:
-                rows = parse(code, name, html)
-                if rows:
-                    all_rows += rows
-                    n_ok += 1
-                else:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(locale="ko-KR", user_agent=UA)
+        page = _new_page(ctx)
+
+        for i, row in uni.iterrows():
+            code, name = str(row["Code"]), str(row["Name"])
+            html, status = fetch(page, code)
+            if html is None:
+                n_fail += 1
+            else:
+                last_html, last_code = html, code
+                if status == "slow":
+                    n_slow += 1
+                try:
+                    rows = parse(code, name, html)
+                    if rows:
+                        all_rows += rows
+                        n_ok += 1
+                    else:
+                        n_empty += 1
+                except Exception as e:  # noqa: BLE001
                     n_empty += 1
-            except Exception as e:  # noqa: BLE001
-                n_parse_err += 1
-                log(f"[skip] {code} {name}: {type(e).__name__}: {e}")
+                    log(f"[skip] {code} {name}: {type(e).__name__}: {e}")
 
-        if i == 4 and not all_rows and not diagnosed and last_html:
-            _diagnose(last_code, last_html)
-            diagnosed = True
+            if i == 4 and not all_rows and not diagnosed and last_html:
+                _diagnose(last_code, last_html)
+                diagnosed = True
 
-        if (i + 1) % 25 == 0 or (i + 1) == len(uni):
-            log(f"  ...{i + 1}/{len(uni)} (ok={n_ok}, empty={n_empty}, "
-                f"redirect={n_redirect}, fail={n_fail}, parse_err={n_parse_err})")
-        time.sleep(SLEEP)
+            if (i + 1) % 25 == 0 or (i + 1) == len(uni):
+                log(f"  ...{i + 1}/{len(uni)} (ok={n_ok}, empty={n_empty}, "
+                    f"slow={n_slow}, fail={n_fail})")
+            # 브라우저 메모리 관리: 100종목마다 페이지 리프레시
+            if (i + 1) % 100 == 0:
+                page.close()
+                page = _new_page(ctx)
+            time.sleep(SLEEP)
+
+        browser.close()
 
     df = pd.DataFrame(
         all_rows,
         columns=["run_date", "code", "name", "wics", "metric", "period", "value"],
     )
     if df.empty:
-        log("[error] 수집 0건 — 위 [diag] 줄로 원인 판별 가능")
+        log("[error] 수집 0건 — 위 [diag] 참조")
         if last_html and not diagnosed:
             _diagnose(last_code, last_html)
         sys.exit(1)
@@ -325,9 +321,8 @@ def main():
     merged.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
     n_wics = df.loc[df["wics"] != "", "wics"].nunique()
-    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 리다이렉트 {n_redirect} "
-        f"/ 접속실패 {n_fail} / 파싱에러 {n_parse_err} / 총 {len(df)}행 "
-        f"/ WICS {n_wics}개 업종")
+    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 지연 {n_slow} "
+        f"/ 실패 {n_fail} / 총 {len(df)}행 / WICS {n_wics}개 업종")
 
 
 if __name__ == "__main__":
