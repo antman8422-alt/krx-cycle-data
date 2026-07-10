@@ -1,0 +1,38 @@
+name: m7-fnguide-weekly
+
+on:
+  schedule:
+    - cron: "0 22 * * 5"   # 금 22:00 UTC = 토 07:00 KST
+  workflow_dispatch:        # 수동 실행 버튼 (모바일 GitHub 앱에서도 가능)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: m7
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests pandas lxml html5lib beautifulsoup4 finance-datareader
+
+      - name: Run scraper
+        run: python m7_fnguide.py
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add data/
+          git commit -m "m7 snapshot $(date -u +%F)" || echo "no changes"
+          git push
