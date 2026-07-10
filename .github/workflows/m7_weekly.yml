@@ -3,7 +3,12 @@ name: m7-fnguide-weekly
 on:
   schedule:
     - cron: "0 22 * * 5"   # 금 22:00 UTC = 토 07:00 KST
-  workflow_dispatch:        # 수동 실행 버튼 (모바일 GitHub 앱에서도 가능)
+  workflow_dispatch:        # 수동 실행 (모바일 GitHub 앱에서도 가능)
+    inputs:
+      top_n:
+        description: "유니버스 크기 (평소 비워두면 300, 테스트는 10)"
+        required: false
+        default: "300"
 
 permissions:
   contents: write
@@ -24,10 +29,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests pandas lxml html5lib beautifulsoup4 finance-datareader
+        run: pip install requests pandas lxml beautifulsoup4 finance-datareader
 
       - name: Run scraper
-        run: python m7_fnguide.py
+        env:
+          M7_TOP_N: ${{ github.event.inputs.top_n || '300' }}
+        run: python -u m7_fnguide.py
 
       - name: Commit data
         run: |
