@@ -2,13 +2,13 @@ name: m7-fnguide-weekly
 
 on:
   schedule:
-    - cron: "0 22 * * 5"   # 금 22:00 UTC = 토 07:00 KST
+    - cron: "0 22 * * 5"   # 금 22:00 UTC = 토 07:00 KST (자동은 항상 300 전체)
   workflow_dispatch:        # 수동 실행 (모바일 GitHub 앱에서도 가능)
     inputs:
       top_n:
-        description: "유니버스 크기 (평소 비워두면 300, 테스트는 10)"
+        description: "유니버스 크기 — 수동 실행 기본은 테스트용 10, 전체는 300 입력"
         required: false
-        default: "300"
+        default: "10"
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -29,9 +29,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          pip install pandas lxml beautifulsoup4 finance-datareader playwright
-          playwright install --with-deps chromium
+        run: pip install requests pandas lxml beautifulsoup4 finance-datareader
 
       - name: Run scraper
         env:
