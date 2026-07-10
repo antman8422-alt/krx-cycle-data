@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-m7_fnguide.py (v4) — FnGuide 컨센서스 주간 스냅샷 수집기 (브라우저 렌더링판)
-==========================================================================
+m7_naver.py 겸 m7_fnguide.py (v5) — 컨센서스 주간 스냅샷 수집기 (네이버 금융판)
+==============================================================================
 목적: 컨센서스(영업이익 추정치)는 과거 소급이 불가능하므로
       매주 스냅샷을 찍어 리비전 시계열을 직접 축적한다.
-부수입: WICS 업종 분류가 같이 수집되어 산업→종목 매핑테이블이 된다.
+부수입: 업종 분류가 같이 수집되어 산업→종목 매핑테이블이 된다.
 
-v4 변경점 (v3 대비):
-- FnGuide가 JS 앱으로 전환됨(서버는 빈 껍데기만 반환)을 확인 →
-  requests 대신 Playwright 헤드리스 크롬으로 렌더링 완료 후 수집
-- 요청 종목코드와 '(E)' 텍스트가 화면에 나타날 때까지 대기 후 파싱
-- 이미지/폰트/미디어 로딩 차단으로 속도 2배 확보
-- 파서는 v3의 내용 기반 연간표 탐지를 그대로 재사용
+v5 변경점 (v4 대비) — 데이터 소스 교체:
+- FnGuide가 해외 데이터센터 IP에 종목 조회를 거부(기본 페이지로 대체)함을
+  확인 → 소스를 네이버 금융 종목 메인(finance.naver.com)으로 교체
+- 네이버는 서버 렌더링이라 브라우저 불필요 → requests로 복귀, 실행 5분대
+- '기업실적분석' 표에서 연간 (E) 컬럼의 매출액/영업이익 추출
+  (연간/분기가 한 표에 공존 → thead 1행의 '연간' colspan으로 연간 열만 선별)
+- 목표주가: 투자의견 표에서 구조적으로 추출 (숫자 오인 방지)
+- 업종: 동일업종 링크 텍스트 (wics 필드에 저장)
 
 스키마(long): run_date, code, name, wics, metric, period, value
   metric = op_e(영업이익 추정, 억원) / rev_e(매출액 추정, 억원) / target_price(원)
 실행: GitHub Actions 주간 cron 또는 로컬 `python m7_fnguide.py`
-      (로컬은 사전 1회: pip install playwright && playwright install chromium)
 """
 import os
 import re
@@ -25,15 +26,20 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 
 KST = timezone(timedelta(hours=9))
 TODAY = datetime.now(KST).strftime("%Y-%m-%d")
 TOP_N = int(os.environ.get("M7_TOP_N", "300") or "300")
-SLEEP = float(os.environ.get("M7_SLEEP", "0.3"))
+SLEEP = float(os.environ.get("M7_SLEEP", "0.4"))
 OUT_DIR = os.path.join("data", "m7_revision")
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Referer": "https://finance.naver.com/",
+}
 
 
 def log(msg):
@@ -41,8 +47,7 @@ def log(msg):
 
 
 def _url(code: str) -> str:
-    return ("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
-            f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=Y&stkGb=701")
+    return f"https://finance.naver.com/item/main.naver?code={code}"
 
 
 # ---------------------------------------------------------------- universe
@@ -80,36 +85,22 @@ def get_universe_safe() -> pd.DataFrame:
         raise
 
 
-# ---------------------------------------------------------------- browser
-def _new_page(ctx):
-    page = ctx.new_page()
-    # 이미지/폰트/미디어 차단 (속도)
-    page.route("**/*", lambda route: route.abort()
-               if route.request.resource_type in ("image", "font", "media")
-               else route.continue_())
-    return page
-
-
-def fetch(page, code: str):
-    """렌더링 완료된 html 반환. (html or None, status ok/slow/fail)"""
-    try:
-        page.goto(_url(code), timeout=25000, wait_until="domcontentloaded")
-    except Exception:  # noqa: BLE001
-        return None, "fail"
-    status = "ok"
-    try:
-        page.wait_for_function(
-            "() => { const t = document.body.innerText;"
-            f" return (t.includes('({code})') || t.includes('A{code}'))"
-            " && t.includes('(E)'); }",
-            timeout=15000,
-        )
-    except Exception:  # noqa: BLE001
-        status = "slow"   # 조건 미충족이어도 일단 내용은 받아서 파싱 시도
-    try:
-        return page.content(), status
-    except Exception:  # noqa: BLE001
-        return None, "fail"
+# ---------------------------------------------------------------- fetch
+def fetch(code: str):
+    """반환: (html or None, status ok/redirected/fail)"""
+    for _ in range(2):
+        try:
+            r = requests.get(_url(code), headers=HEADERS, timeout=15)
+            if r.status_code == 200 and len(r.text) > 5000:
+                html = r.text
+                page = _pagecode(html)
+                if page == code:
+                    return html, "ok"
+                return html, "redirected"
+        except requests.RequestException:
+            pass
+        time.sleep(2)
+    return None, "fail"
 
 
 # ---------------------------------------------------------------- parse
@@ -124,69 +115,89 @@ def _clean_num(s: str):
 
 
 def _pagecode(html: str) -> str:
-    m = re.search(r"\((A?\d{6})\)", html[:5000])
-    return m.group(1).lstrip("A") if m else ""
+    """종목명 옆 <span class="code">005930</span>에서 실제 페이지 코드 추출."""
+    soup = BeautifulSoup(html[:20000], "lxml")
+    node = soup.select_one("span.code")
+    if node:
+        m = re.search(r"\d{6}", node.get_text())
+        if m:
+            return m.group(0)
+    m = re.search(r'class="code"[^>]*>\s*(\d{6})', html)
+    return m.group(1) if m else ""
 
 
-def _extract_wics(soup: BeautifulSoup) -> str:
-    node = soup.find(string=re.compile("WICS"))
-    if not node:
-        return ""
-    return re.sub(r".*WICS\s*:\s*", "", str(node)).strip()
+def _extract_industry(soup: BeautifulSoup) -> str:
+    """동일업종 링크(업종 상세) 텍스트 = 업종명."""
+    a = soup.select_one("a[href*='upjong']")
+    return a.get_text(strip=True) if a else ""
 
 
-def _extract_target_price(text: str):
-    m = re.search(r"목표주가\s*([0-9][0-9,]*)", text)
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
+def _extract_target_price(soup: BeautifulSoup):
+    """투자의견 표: <th>투자의견 l 목표주가</th> 옆 <td>의 마지막 숫자 em.
+    '4.00매수' 같은 의견 점수를 목표가로 오인하지 않도록 구조적으로 추출."""
+    for th in soup.find_all("th"):
+        if "목표주가" not in th.get_text():
+            continue
+        td = th.find_next("td")
+        if not td:
+            continue
+        cand = None
+        for em in td.find_all("em"):
+            v = _clean_num(em.get_text(strip=True))
+            if v is not None:
+                cand = v          # 마지막 숫자(목표주가)가 남는다
+        if cand is not None and cand > 100:   # 의견점수(1~5) 배제 안전핀
+            return cand
+    m = re.search(r"목표주가[^0-9]{0,30}?([0-9]{2,3}(?:,[0-9]{3})+)",
+                  soup.get_text(" ", strip=True))
+    if m:
+        return _clean_num(m.group(1))
+    return None
 
 
-def _row_labels(tbody) -> list:
-    out = []
-    for tr in tbody.find_all("tr"):
-        cell = tr.find(["th", "td"])
-        if cell:
-            out.append(re.sub(r"\s+", "", cell.get_text(" ", strip=True)))
-    return out
-
-
-def _find_annual_table(soup: BeautifulSoup):
-    """div id에 의존하지 않고 연간 컨센서스 표를 내용으로 탐지.
-    조건: thead 마지막 행에 (E) 컬럼 + tbody에 '영업이익' 행.
-    복수 후보면 기간 간격이 12개월(연간)인 표를 우선."""
-    fallback = None
+def _find_perf_table(soup: BeautifulSoup):
+    """'기업실적분석' 표를 내용으로 탐지: thead에 (E) 컬럼 + '연간' 라벨,
+    tbody에 '영업이익' 행. 반환: (table, 기간리스트, 연간열 인덱스 집합)"""
     for table in soup.find_all("table"):
         thead, tbody = table.find("thead"), table.find("tbody")
         if not (thead and tbody):
             continue
         hrows = thead.find_all("tr")
-        periods = [c.get_text(strip=True)
-                   for c in hrows[-1].find_all(["th", "td"])]
-        if not any("(E)" in p for p in periods):
+        row_last = [c.get_text(strip=True)
+                    for c in hrows[-1].find_all(["th", "td"])]
+        if not any("(E)" in p for p in row_last):
             continue
-        if "영업이익" not in _row_labels(tbody):
+        labels = []
+        for tr in tbody.find_all("tr"):
+            cell = tr.find(["th", "td"])
+            if cell:
+                labels.append(re.sub(r"\s+", "", cell.get_text(" ", strip=True)))
+        if "영업이익" not in labels:
             continue
-        months = []
-        for p in periods:
-            m = re.search(r"(\d{4})/(\d{2})", p)
-            if m:
-                months.append(int(m.group(1)) * 12 + int(m.group(2)))
-        gaps = [b - a for a, b in zip(months, months[1:]) if b > a]
-        if gaps and min(gaps) >= 12:
-            return table, periods          # 연간 표 확정
-        if fallback is None:
-            fallback = (table, periods)    # 차선(혼합/분기형)
-    return fallback if fallback else (None, None)
+
+        # 연간 열 선별: thead 1행의 '연간' colspan 구간
+        ann_idx = set()
+        if len(hrows) >= 2:
+            pos = 0
+            for c in hrows[0].find_all(["th", "td"]):
+                if c.get("rowspan"):      # '주요재무정보' 라벨 칸은 열 미점유
+                    continue
+                span = int(c.get("colspan", 1))
+                if "연간" in c.get_text(strip=True):
+                    ann_idx.update(range(pos, pos + span))
+                pos += span
+        if not ann_idx:                   # 폴백: 12월 결산 기간만 연간 취급
+            ann_idx = {i for i, p in enumerate(row_last)
+                       if re.search(r"\d{4}[./]12", p)}
+        return table, row_last, ann_idx
+    return None, None, None
 
 
 def _annual_estimates(soup: BeautifulSoup) -> dict:
-    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원."""
+    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원.
+    반환: {("op_e","2026/12"): 605000.0, ...}"""
     out = {}
-    table, periods = _find_annual_table(soup)
+    table, periods, ann_idx = _find_perf_table(soup)
     if table is None:
         return out
     tbody = table.find("tbody")
@@ -200,24 +211,26 @@ def _annual_estimates(soup: BeautifulSoup) -> dict:
         if not metric:
             continue
         vals = cells[1:]
-        # 헤더에 라벨 칸이 포함된 1줄 thead 구조면 한 칸 밀기
         pers = periods[1:] if len(periods) == len(vals) + 1 else periods
+        offset = 1 if pers is not periods else 0
         for i, p in enumerate(pers):
             if "(E)" not in p or i >= len(vals):
                 continue
+            if ann_idx and (i + offset) not in ann_idx:
+                continue                  # 분기 (E)는 제외
             v = _clean_num(vals[i].get_text(strip=True))
             if v is not None:
-                out[(metric, p.replace("(E)", "").strip())] = v
+                period = p.replace("(E)", "").strip().replace(".", "/")
+                out[(metric, period)] = v
     return out
 
 
 def parse(code: str, name: str, html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
-    wics = _extract_wics(soup)
+    wics = _extract_industry(soup)
     rows = []
 
-    tp = _extract_target_price(text)
+    tp = _extract_target_price(soup)
     if tp is not None:
         rows.append([TODAY, code, name, wics, "target_price", "", tp])
 
@@ -236,66 +249,50 @@ def _diagnose(req_code: str, html: str):
     log(f"[diag] len={len(html)} title='{title[:60]}' "
         f"tables={len(soup.find_all('table'))}")
     log(f"[diag] html 내 '(E)' {html.count('(E)')}회 / "
-        f"'영업이익' {html.count('영업이익')}회")
+        f"'영업이익' {html.count('영업이익')}회 / "
+        f"'기업실적분석' {html.count('기업실적분석')}회")
 
 
 # ---------------------------------------------------------------- main
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     uni = get_universe_safe()
-    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s (browser)")
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log("[error] playwright 미설치: pip install playwright && "
-            "playwright install chromium")
-        sys.exit(1)
+    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s (naver)")
 
     all_rows = []
-    n_ok = n_empty = n_fail = n_slow = 0
+    n_ok = n_empty = n_fail = n_redirect = 0
     last_html, last_code = None, ""
     diagnosed = False
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(locale="ko-KR", user_agent=UA)
-        page = _new_page(ctx)
-
-        for i, row in uni.iterrows():
-            code, name = str(row["Code"]), str(row["Name"])
-            html, status = fetch(page, code)
-            if html is None:
-                n_fail += 1
-            else:
-                last_html, last_code = html, code
-                if status == "slow":
-                    n_slow += 1
-                try:
-                    rows = parse(code, name, html)
-                    if rows:
-                        all_rows += rows
-                        n_ok += 1
-                    else:
-                        n_empty += 1
-                except Exception as e:  # noqa: BLE001
+    for i, row in uni.iterrows():
+        code, name = str(row["Code"]), str(row["Name"])
+        html, status = fetch(code)
+        if html is None:
+            n_fail += 1
+        elif status == "redirected":
+            n_redirect += 1
+            last_html, last_code = html, code
+        else:
+            last_html, last_code = html, code
+            try:
+                rows = parse(code, name, html)
+                if rows:
+                    all_rows += rows
+                    n_ok += 1
+                else:
                     n_empty += 1
-                    log(f"[skip] {code} {name}: {type(e).__name__}: {e}")
+            except Exception as e:  # noqa: BLE001
+                n_empty += 1
+                log(f"[skip] {code} {name}: {type(e).__name__}: {e}")
 
-            if i == 4 and not all_rows and not diagnosed and last_html:
-                _diagnose(last_code, last_html)
-                diagnosed = True
+        if i == 4 and not all_rows and not diagnosed and last_html:
+            _diagnose(last_code, last_html)
+            diagnosed = True
 
-            if (i + 1) % 25 == 0 or (i + 1) == len(uni):
-                log(f"  ...{i + 1}/{len(uni)} (ok={n_ok}, empty={n_empty}, "
-                    f"slow={n_slow}, fail={n_fail})")
-            # 브라우저 메모리 관리: 100종목마다 페이지 리프레시
-            if (i + 1) % 100 == 0:
-                page.close()
-                page = _new_page(ctx)
-            time.sleep(SLEEP)
-
-        browser.close()
+        if (i + 1) % 25 == 0 or (i + 1) == len(uni):
+            log(f"  ...{i + 1}/{len(uni)} (ok={n_ok}, empty={n_empty}, "
+                f"redirect={n_redirect}, fail={n_fail})")
+        time.sleep(SLEEP)
 
     df = pd.DataFrame(
         all_rows,
@@ -321,8 +318,8 @@ def main():
     merged.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
     n_wics = df.loc[df["wics"] != "", "wics"].nunique()
-    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 지연 {n_slow} "
-        f"/ 실패 {n_fail} / 총 {len(df)}행 / WICS {n_wics}개 업종")
+    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 리다이렉트 {n_redirect} "
+        f"/ 실패 {n_fail} / 총 {len(df)}행 / 업종 {n_wics}개")
 
 
 if __name__ == "__main__":
