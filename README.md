@@ -24,8 +24,10 @@ Create repository
 3	`.github/workflows/m7_weekly.yml`	자동 실행 스케줄
 4. 첫 실행 (수동 테스트)
 상단 Actions 탭 → 워크플로우 활성화 버튼이 보이면 클릭 →
-좌측 `m7-fnguide-weekly` → 우측 Run workflow → Run.
-약 5~8분 소요. 초록 체크가 뜨면 성공.
+좌측 `m7-fnguide-weekly` → 우측 Run workflow.
+`top_n` 입력칸이 뜨는데, 첫 테스트는 `10`을 입력해 1~2분짜리 미니 실행으로
+정상 작동을 확인한 뒤, 다시 Run workflow(빈칸 = 300)로 본 실행을 돌린다.
+본 실행은 약 10~20분 소요. 초록 체크가 뜨면 성공.
 5. 결과 확인
 repo의 `data/m7_revision/` 폴더에
 `YYYY-MM-DD.csv` — 당일 스냅샷
@@ -47,8 +49,10 @@ metric	의미	단위
 `period`는 `2026/12` 형식의 회계연도. `wics`는 FnGuide WICS 업종명.
 리비전 계산(추후 Colab): 종목별 `op_e`의 4주/12주 변화율 → WICS 업종별 중앙값 집계.
 실패 시 폴백
-Actions 로그에 `수집 0건`이 찍히면 FnGuide가 해외 IP(GitHub 서버)를 차단한 경우다.
-PC(국내 IP)에서 로컬 실행:
+수집 0건으로 실패하면 로그의 `[diag]` 줄이 원인을 말해준다:
+`title`이 종목명이 아니거나 `tables=0` → FnGuide가 해외 IP(GitHub 서버)를 차단한 경우
+`tables`는 많은데 `highlight_D_A=X` → 페이지 구조 변경 (코드 수정 필요)
+차단 케이스면 PC(국내 IP)에서 로컬 실행:
 ```
 pip install requests pandas lxml html5lib beautifulsoup4 finance-datareader
 python m7_fnguide.py
