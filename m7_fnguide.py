@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-m7_fnguide.py (v2) — FnGuide 컨센서스 주간 스냅샷 수집기
+m7_fnguide.py (v3) — FnGuide 컨센서스 주간 스냅샷 수집기
 =========================================================
-목적: 컨센서스(영업이익 추정치·목표주가)는 과거 소급이 불가능하므로
+목적: 컨센서스(영업이익 추정치)는 과거 소급이 불가능하므로
       매주 스냅샷을 찍어 리비전 시계열을 직접 축적한다.
 부수입: WICS 업종 분류가 같이 수집되어 산업→종목 매핑테이블이 된다.
 
-v2 변경점:
-- pandas read_html 의존 제거 → Financial Highlight 표를 BeautifulSoup으로 직접 파싱
-  (pandas 3.x에서 read_html이 FnGuide 표 구조에 IndexError를 던지는 문제 해결)
-- 진단 모드: 초기 5종목에서 수집 0건이면 페이지 상태([diag])를 자동 출력
-- 모든 로그 flush → Actions에서 실시간 확인 가능
+v3 변경점 (v2 대비):
+- 세션 워밍업 + 쿠키 유지: 세션 없는 접근을 기본 페이지(삼성전자)로
+  돌려보내는 서버 동작에 대응
+- 페이지코드 검증: 응답 페이지의 종목코드가 요청과 다르면 재시도,
+  계속 다르면 'redirected'로 집계하고 오염 데이터 저장 방지
+- 연간 컨센서스 표를 div id가 아니라 내용으로 탐지
+  (thead에 (E) 컬럼 + tbody에 영업이익 행 + 기간 간격 12개월)
+- 진단 강화: 실패 시 요청/응답 코드 불일치 여부, 영업이익 표를 품은
+  div id 목록, html 내 '(E)' 출현 횟수까지 출력
 
-유니버스: KRX 시가총액 상위 N (기본 300, 환경변수 M7_TOP_N로 조절)
-저장:
-  data/m7_revision/YYYY-MM-DD.csv   (당일 스냅샷)
-  data/m7_revision/history.csv      (누적, run_date+code+metric+period 중복제거)
 스키마(long): run_date, code, name, wics, metric, period, value
   metric = op_e(영업이익 추정, 억원) / rev_e(매출액 추정, 억원) / target_price(원)
 실행: GitHub Actions 주간 cron 또는 로컬에서 `python m7_fnguide.py`
@@ -41,11 +41,20 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
     "Referer": "https://comp.fnguide.com/",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def _url(code: str) -> str:
+    return ("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
+            f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=Y&stkGb=701")
 
 
 # ---------------------------------------------------------------- universe
@@ -84,18 +93,39 @@ def get_universe_safe() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- fetch
+def _pagecode(html: str) -> str:
+    """페이지 상단(title 근처)에서 실제 표시 중인 종목코드 추출."""
+    m = re.search(r"\((A?\d{6})\)", html[:3000])
+    return m.group(1).lstrip("A") if m else ""
+
+
+def warmup():
+    """세션 쿠키 확보용 선행 접속."""
+    try:
+        SESSION.get(_url("005930"), timeout=15)
+        time.sleep(1.0)
+    except requests.RequestException:
+        pass
+
+
 def fetch(code: str):
-    url = ("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
-           f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=Y&stkGb=701")
-    for _ in range(2):
+    """반환: (html or None, status)  status ∈ ok / redirected / fail"""
+    last_mismatch = None
+    for _ in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = SESSION.get(_url(code), timeout=15)
             if r.status_code == 200 and len(r.text) > 5000:
-                return r.text
+                if _pagecode(r.text) == code:
+                    return r.text, "ok"
+                last_mismatch = r.text
+                time.sleep(1.5)
+                continue
         except requests.RequestException:
             pass
         time.sleep(2)
-    return None
+    if last_mismatch is not None:
+        return last_mismatch, "redirected"
+    return None, "fail"
 
 
 # ---------------------------------------------------------------- parse
@@ -126,30 +156,54 @@ def _extract_target_price(text: str):
         return None
 
 
+def _row_labels(tbody) -> list:
+    out = []
+    for tr in tbody.find_all("tr"):
+        cell = tr.find(["th", "td"])
+        if cell:
+            out.append(re.sub(r"\s+", "", cell.get_text(" ", strip=True)))
+    return out
+
+
+def _find_annual_table(soup: BeautifulSoup):
+    """div id에 의존하지 않고 연간 컨센서스 표를 내용으로 탐지.
+    조건: thead 마지막 행에 (E) 컬럼 존재 + tbody에 '영업이익' 행 존재.
+    복수 후보면 기간 간격이 12개월(연간)인 표를 우선."""
+    fallback = None
+    for table in soup.find_all("table"):
+        thead, tbody = table.find("thead"), table.find("tbody")
+        if not (thead and tbody):
+            continue
+        hrows = thead.find_all("tr")
+        periods = [c.get_text(strip=True)
+                   for c in hrows[-1].find_all(["th", "td"])]
+        if not any("(E)" in p for p in periods):
+            continue
+        if "영업이익" not in _row_labels(tbody):
+            continue
+        months = []
+        for p in periods:
+            m = re.search(r"(\d{4})/(\d{2})", p)
+            if m:
+                months.append(int(m.group(1)) * 12 + int(m.group(2)))
+        gaps = [b - a for a, b in zip(months, months[1:]) if b > a]
+        if gaps and min(gaps) >= 12:
+            return table, periods          # 연간 표 확정
+        if fallback is None:
+            fallback = (table, periods)    # 차선(혼합/분기형)
+    return fallback if fallback else (None, None)
+
+
 def _annual_estimates(soup: BeautifulSoup) -> dict:
-    """Financial Highlight 연간 테이블(#highlight_D_A)에서
-    (E) 컬럼의 매출액/영업이익을 직접 파싱. 단위: 억원.
+    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원.
     반환: {("op_e","2026/12"): 12345.0, ...}"""
     out = {}
-    div = None
-    for did in ("highlight_D_A", "highlight_B_A"):   # 연결 우선, 없으면 별도
-        div = soup.find(id=did)
-        if div:
-            break
-    if not div:
+    table, periods = _find_annual_table(soup)
+    if table is None:
         return out
-    table = div.find("table")
-    if not (table and table.find("thead") and table.find("tbody")):
-        return out
+    tbody = table.find("tbody")
 
-    hrows = table.find("thead").find_all("tr")
-    periods = [c.get_text(strip=True)
-               for c in hrows[-1].find_all(["th", "td"])]
-    # thead가 한 줄짜리면 첫 칸은 'IFRS(연결)' 같은 라벨이므로 제거
-    if len(hrows) == 1 and periods and not re.search(r"\d{4}", periods[0]):
-        periods = periods[1:]
-
-    for tr in table.find("tbody").find_all("tr"):
+    for tr in tbody.find_all("tr"):
         cells = tr.find_all(["th", "td"])
         if len(cells) < 2:
             continue
@@ -158,7 +212,12 @@ def _annual_estimates(soup: BeautifulSoup) -> dict:
         if not metric:
             continue
         vals = cells[1:]
-        for i, p in enumerate(periods):
+        # 헤더-값 정렬: 헤더 행에 라벨 칸이 포함된 구조(1줄 thead)면 한 칸 밀기
+        if len(periods) == len(vals) + 1:
+            pers = periods[1:]
+        else:
+            pers = periods
+        for i, p in enumerate(pers):
             if "(E)" not in p or i >= len(vals):
                 continue
             v = _clean_num(vals[i].get_text(strip=True))
@@ -183,14 +242,21 @@ def parse(code: str, name: str, html: str) -> list:
     return rows
 
 
-def _diagnose(code: str, html: str):
-    """수집이 전멸일 때 원인 판별용 페이지 상태 출력."""
+def _diagnose(req_code: str, html: str):
+    """수집이 전멸일 때 원인 판별용 상태 출력."""
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else "(no title)"
-    log(f"[diag] code={code} len={len(html)} title='{title[:60]}' "
-        f"tables={len(soup.find_all('table'))} "
-        f"highlight_D_A={'O' if soup.find(id='highlight_D_A') else 'X'}")
-    log(f"[diag] text[:180]={soup.get_text(' ', strip=True)[:180]}")
+    page = _pagecode(html)
+    mismatch = " (불일치 -> 세션/봇감지 의심)" if page and page != req_code else ""
+    log(f"[diag] 요청코드={req_code} 페이지코드={page or '?'}{mismatch}")
+    log(f"[diag] len={len(html)} title='{title[:60]}' "
+        f"tables={len(soup.find_all('table'))}")
+    ids = sorted({d.get("id") for d in soup.find_all("div", id=True)
+                  if d.find("table") and "영업이익" in d.get_text()})
+    log(f"[diag] '영업이익' 표를 품은 div id: {ids[:10] if ids else '없음'}")
+    log(f"[diag] html 내 '(E)' {html.count('(E)')}회 / "
+        f"'영업이익' {html.count('영업이익')}회 "
+        f"(둘 다 많은데 수집 0이면 코드 문제, '(E)'가 0이면 값이 JS 지연로딩)")
 
 
 # ---------------------------------------------------------------- main
@@ -198,19 +264,23 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     uni = get_universe_safe()
     log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s")
+    warmup()
 
     all_rows = []
-    n_ok = n_empty = n_fetch_fail = n_parse_err = 0
-    last_html = None
+    n_ok = n_empty = n_fail = n_redirect = n_parse_err = 0
+    last_html, last_code = None, ""
     diagnosed = False
 
     for i, row in uni.iterrows():
         code, name = str(row["Code"]), str(row["Name"])
-        html = fetch(code)
-        if html is None:
-            n_fetch_fail += 1
+        html, status = fetch(code)
+        if status == "fail":
+            n_fail += 1
+        elif status == "redirected":
+            n_redirect += 1
+            last_html, last_code = html, code
         else:
-            last_html = html
+            last_html, last_code = html, code
             try:
                 rows = parse(code, name, html)
                 if rows:
@@ -222,14 +292,13 @@ def main():
                 n_parse_err += 1
                 log(f"[skip] {code} {name}: {type(e).__name__}: {e}")
 
-        # 초기 5종목에서 전멸이면 즉시 원인 진단 1회
         if i == 4 and not all_rows and not diagnosed and last_html:
-            _diagnose(code, last_html)
+            _diagnose(last_code, last_html)
             diagnosed = True
 
-        if (i + 1) % 25 == 0:
+        if (i + 1) % 25 == 0 or (i + 1) == len(uni):
             log(f"  ...{i + 1}/{len(uni)} (ok={n_ok}, empty={n_empty}, "
-                f"fetch_fail={n_fetch_fail}, parse_err={n_parse_err})")
+                f"redirect={n_redirect}, fail={n_fail}, parse_err={n_parse_err})")
         time.sleep(SLEEP)
 
     df = pd.DataFrame(
@@ -237,11 +306,9 @@ def main():
         columns=["run_date", "code", "name", "wics", "metric", "period", "value"],
     )
     if df.empty:
-        log("[error] 수집 0건 — 위 [diag] 줄로 원인 판별:")
-        log("  title이 정상 종목명이 아니거나 tables=0이면 접근 차단 → PC(국내 IP) 로컬 실행 폴백")
-        log("  tables는 많은데 highlight_D_A=X면 페이지 구조 변경 → 코드 수정 필요")
+        log("[error] 수집 0건 — 위 [diag] 줄로 원인 판별 가능")
         if last_html and not diagnosed:
-            _diagnose("(last)", last_html)
+            _diagnose(last_code, last_html)
         sys.exit(1)
 
     snap_path = os.path.join(OUT_DIR, f"{TODAY}.csv")
@@ -258,8 +325,9 @@ def main():
     merged.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
     n_wics = df.loc[df["wics"] != "", "wics"].nunique()
-    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 접속실패 {n_fetch_fail} "
-        f"/ 파싱에러 {n_parse_err} / 총 {len(df)}행 / WICS {n_wics}개 업종")
+    log(f"[done] {TODAY}: 성공 {n_ok} / 컨센없음 {n_empty} / 리다이렉트 {n_redirect} "
+        f"/ 접속실패 {n_fail} / 파싱에러 {n_parse_err} / 총 {len(df)}행 "
+        f"/ WICS {n_wics}개 업종")
 
 
 if __name__ == "__main__":
