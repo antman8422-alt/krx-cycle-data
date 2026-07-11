@@ -154,10 +154,51 @@ res["run_date"] = TODAY
 res = res[["run_date", "sector", "league", "code", "name",
            "exc1", "exc3", "prox", "a20", "shD", "score"]]
 
-# ══════════ 5. 저장: CSV + TV 워치리스트 ══════════
+# ══════════ 5. 저장: CSV + TV 워치리스트 + 사람용 요약 ══════════
 os.makedirs(OUT_DIR, exist_ok=True)
 res.to_csv(os.path.join(OUT_DIR, f"{TODAY}.csv"), index=False, encoding="utf-8-sig")
 res.to_csv(os.path.join(OUT_DIR, "latest.csv"), index=False, encoding="utf-8-sig")
+
+# 사람용 요약.md — 폰 GitHub 앱에서 표로 렌더링되는 판
+md = [f"# 주간 선봉 리포트 — {TODAY}", ""]
+picks = []
+for srow in top.itertuples():
+    sec = srow.sec
+    r = res[res["sector"] == sec]
+    sb = r[r["league"] == "선봉"]
+    if len(sb):
+        b = sb.iloc[0]
+        tags = []
+        if len(sb) < 5:
+            tags.append("⚠소표본")
+        if b["exc3"] <= 0:
+            tags.append("🚩초과음수(나쁜무리1등)")
+        tag = (" " + "·".join(tags)) if tags else ""
+        picks.append(f"**{b['name']}** ({sec}, 점수 {b['score']}, "
+                     f"초과3M {b['exc3']*100:+.0f}%){tag}")
+md.append("## 이번 주 픽 후보 (검증 원형: 리그 top1 전원 — 꼬리표는 경고)")
+md += [f"- {p}" for p in picks] if picks else ["- (해당 없음)"]
+md.append("")
+for srow in top.itertuples():
+    sec = srow.sec
+    r = res[res["sector"] == sec]
+    for lg, title in (("선봉", "선봉 (매매 후보)"), ("대장(깃발)", "대장 — 깃발(참고)")):
+        g = r[r["league"] == lg].head(6)
+        if g.empty:
+            continue
+        warn = " ⚠소표본(순위 신뢰 낮음)" if lg == "선봉" and len(r[r["league"] == lg]) < 5 else ""
+        md.append(f"## {sec} · {title}{warn}")
+        md.append("| 종목 | 초과1M | 초과3M | 52주% | 대금(억) | Δ점유 | 점수 |")
+        md.append("|---|---|---|---|---|---|---|")
+        for _, x in g.iterrows():
+            md.append(f"| {x['name']} | {x['exc1']*100:+.1f}% | {x['exc3']*100:+.1f}% "
+                      f"| {x['prox']*100:.0f} | {x['a20']/1e8:,.0f} "
+                      f"| {x['shD']*100:+.2f} | **{x['score']}** |")
+        md.append("")
+md.append("> 읽기 규칙: 점수는 리그 내 상대평가 — 반드시 초과3M과 함께 볼 것. "
+          "100점이어도 초과3M 음수면 '나쁜 무리의 1등'. 검증 지평 H40(~8주).")
+with open(os.path.join(OUT_DIR, "요약.md"), "w", encoding="utf-8") as f:
+    f.write("\n".join(md))
 
 wl_lines = []
 for sec in top["sec"]:
