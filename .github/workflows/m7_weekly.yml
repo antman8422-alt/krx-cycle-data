@@ -2,7 +2,8 @@ name: m7-fnguide-weekly
 
 on:
   schedule:
-    - cron: "0 22 * * 5"   # 금 22:00 UTC = 토 07:00 KST (자동은 항상 300 전체)
+    - cron: "37 22 * * 5"   # 토 07:37 KST (1차 — 정각 혼잡 회피)
+    - cron: "7 3 * * 6"     # 토 12:07 KST (2차 보험 — 1차 성공 시 같은날 덮어쓰기라 무해)
   workflow_dispatch:        # 수동 실행 (모바일 GitHub 앱에서도 가능)
     inputs:
       top_n:
@@ -35,6 +36,9 @@ jobs:
         env:
           M7_TOP_N: ${{ github.event.inputs.top_n || '300' }}
         run: python -u m7_fnguide.py
+
+      - name: Build leader list
+        run: python -u leader_weekly.py
 
       - name: Commit data
         run: |
