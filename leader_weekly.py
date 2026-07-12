@@ -202,9 +202,9 @@ for sec in top["sec"]:
     small = len(r[r["league"] == "선봉"]) < 5
     for i, (_, x) in enumerate(sb.iterrows(), 1):
         tg = ("⚠" if small else "") + ("🚩" if x["exc3"] <= 0 else "")
-        badge_items.append(f"{x['code']}={sec}·선봉{i}·{int(x['score'])}{tg}")
+        badge_items.append(f"{x['code']}={sec}·선봉{i}·{int(x['score'])}{tg}·{x['name']}")
     for _, x in r[r["league"] == "대장(깃발)"].head(WL_DJ).iterrows():
-        badge_items.append(f"{x['code']}={sec}·깃발·{int(x['score'])}")
+        badge_items.append(f"{x['code']}={sec}·깃발·{int(x['score'])}·{x['name']}")
 md.append("**TV 뱃지 문자열** (뱃지 지표 설정에 통째 붙여넣기):")
 md.append("```")
 md.append(",".join(badge_items))
