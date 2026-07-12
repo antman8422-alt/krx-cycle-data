@@ -195,6 +195,21 @@ for srow in top.itertuples():
                       f"| {x['prox']*100:.0f} | {x['a20']/1e8:,.0f} "
                       f"| {x['shD']*100:+.2f} | **{x['score']}** |")
         md.append("")
+badge_items = []
+for sec in top["sec"]:
+    r = res[res["sector"] == sec]
+    sb = r[r["league"] == "선봉"].head(WL_SB)
+    small = len(r[r["league"] == "선봉"]) < 5
+    for i, (_, x) in enumerate(sb.iterrows(), 1):
+        tg = ("⚠" if small else "") + ("🚩" if x["exc3"] <= 0 else "")
+        badge_items.append(f"{x['code']}={sec}·선봉{i}·{int(x['score'])}{tg}")
+    for _, x in r[r["league"] == "대장(깃발)"].head(WL_DJ).iterrows():
+        badge_items.append(f"{x['code']}={sec}·깃발·{int(x['score'])}")
+md.append("**TV 뱃지 문자열** (뱃지 지표 설정에 통째 붙여넣기):")
+md.append("```")
+md.append(",".join(badge_items))
+md.append("```")
+md.append("")
 md.append("> 읽기 규칙: 점수는 리그 내 상대평가 — 반드시 초과3M과 함께 볼 것. "
           "100점이어도 초과3M 음수면 '나쁜 무리의 1등'. 검증 지평 H40(~8주).")
 with open(os.path.join(OUT_DIR, "요약.md"), "w", encoding="utf-8") as f:
