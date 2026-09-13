@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-m7_fnguide.py (v6) — 컨센서스 주간 스냅샷 수집기 (네이버 금융판)
+m7_fnguide.py (v7) — 컨센서스 주간 스냅샷 수집기 (FnGuide 복귀판)
 ================================================================
-목적: 컨센서스(영업이익 추정치)는 과거 소급이 불가능하므로
-      매주 스냅샷을 찍어 리비전 시계열을 직접 축적한다.
-부수입: 업종 분류가 같이 수집되어 산업→종목 매핑테이블이 된다.
+v7 변경점 (v6 대비):
+- 2026-09-12 네이버 금융이 'Npay 증권'(JS 앱)으로 개편 → 구 item/main.naver
+  페이지의 HTML 표가 소멸, 전 종목 redirected 판정으로 수집 0건.
+- 소스를 FnGuide(comp.fnguide.com SVD_Main)로 전환. 정적 HTML이라 표 파싱 가능,
+  업종(FICS)·목표주가·연간(E) 매출/영업이익 모두 한 페이지에서 나옴.
+- 네이버 경로는 M7_SOURCE=naver 로 보존 (환경변수 한 줄로 롤백 가능).
+- 파싱 철학은 v6 그대로: 구조 무가정 탐지 + 실패 시 지문 자동 덤프.
 
-v6 변경점 (v5 대비):
-- 기업실적분석 표 파서를 구조 무가정(thead/tbody 유무, th/td 무관)으로 재작성
-  · 헤더 행 = "기간 패턴(YYYY.MM) 셀 3개 이상 + (E) 포함"인 행 (내용 탐지)
-  · 연간 열 = '연간' colspan 행에서 계산, 없으면 선행 4열 (네이버 고정 레이아웃)
-- 진행 로그에 op(영업이익E 수집 종목 수) 카운터 노출
-- 실행 종료 시 op=0이면 실제 표들의 헤더 원문 지문을 자동 덤프
-  → 다음 로그 한 장으로 구조를 정확히 알 수 있음
-
-스키마(long): run_date, code, name, wics, metric, period, value
-  metric = op_e(영업이익 추정, 억원) / rev_e(매출액 추정, 억원) / target_price(원)
+스키마(long): run_date, code, name, wics, metric, period, value  (v6과 동일)
 실행: GitHub Actions 주간 cron 또는 로컬 `python m7_fnguide.py`
+의존성: pip install requests beautifulsoup4 lxml pandas finance-datareader
 """
 import os
 import re
@@ -32,12 +28,12 @@ KST = timezone(timedelta(hours=9))
 TODAY = datetime.now(KST).strftime("%Y-%m-%d")
 TOP_N = int(os.environ.get("M7_TOP_N", "300") or "300")
 SLEEP = float(os.environ.get("M7_SLEEP", "0.4"))
+SOURCE = os.environ.get("M7_SOURCE", "fnguide").lower()   # fnguide | naver
 OUT_DIR = os.path.join("data", "m7_revision")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9",
-    "Referer": "https://finance.naver.com/",
 }
 PERIOD_RE = re.compile(r"\d{4}[./]\d{2}")
 
@@ -46,20 +42,15 @@ def log(msg):
     print(msg, flush=True)
 
 
-def _url(code: str) -> str:
-    return f"https://finance.naver.com/item/main.naver?code={code}"
-
-
 # ---------------------------------------------------------------- universe
 def get_universe(top_n: int = TOP_N) -> pd.DataFrame:
-    """KRX 시총 상위 N 보통주. 실패 시 예외."""
     import FinanceDataReader as fdr
 
     df = fdr.StockListing("KRX")
     code_col = "Code" if "Code" in df.columns else "Symbol"
     df = df[df[code_col].astype(str).str.len() == 6].copy()
     df[code_col] = df[code_col].astype(str)
-    df = df[df[code_col].str.endswith("0")]          # 보통주만
+    df = df[df[code_col].str.endswith("0")]
     df = df[~df["Name"].astype(str).str.contains("스팩")]
     if "Marcap" in df.columns:
         df = df.sort_values("Marcap", ascending=False)
@@ -69,7 +60,6 @@ def get_universe(top_n: int = TOP_N) -> pd.DataFrame:
 
 
 def get_universe_safe() -> pd.DataFrame:
-    """FDR 실패 시 직전 history의 유니버스 재사용 (수집 연속성 확보)."""
     try:
         return get_universe()
     except Exception as e:  # noqa: BLE001
@@ -86,15 +76,31 @@ def get_universe_safe() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- fetch
+def _url(code: str) -> str:
+    if SOURCE == "naver":
+        return f"https://finance.naver.com/item/main.naver?code={code}"
+    return ("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
+            f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701")
+
+
+def _referer() -> str:
+    return ("https://finance.naver.com/" if SOURCE == "naver"
+            else "https://comp.fnguide.com/")
+
+
 def fetch(code: str):
     """반환: (html or None, status ok/redirected/fail)"""
+    headers = dict(HEADERS, Referer=_referer())
     for _ in range(2):
         try:
-            r = requests.get(_url(code), headers=HEADERS, timeout=15)
+            r = requests.get(_url(code), headers=headers, timeout=20)
             if r.status_code == 200 and len(r.text) > 5000:
                 html = r.text
                 page = _pagecode(html)
                 if page == code:
+                    return html, "ok"
+                # FnGuide는 코드 스팬이 없을 수 있음 — 종목코드 문자열 존재로 2차 판정
+                if SOURCE != "naver" and (f"A{code}" in html or code in html):
                     return html, "ok"
                 return html, "redirected"
         except requests.RequestException:
@@ -103,7 +109,7 @@ def fetch(code: str):
     return None, "fail"
 
 
-# ---------------------------------------------------------------- parse
+# ---------------------------------------------------------------- parse (공통)
 def _clean_num(s: str):
     s = s.replace(",", "").strip()
     if s in ("", "-", "N/A", "n/a"):
@@ -119,7 +125,6 @@ def _cell_texts(tr) -> list:
 
 
 def _pagecode(html: str) -> str:
-    """종목명 옆 <span class="code">005930</span>에서 실제 페이지 코드 추출."""
     soup = BeautifulSoup(html[:20000], "lxml")
     node = soup.select_one("span.code")
     if node:
@@ -131,26 +136,32 @@ def _pagecode(html: str) -> str:
 
 
 def _extract_industry(soup: BeautifulSoup) -> str:
-    """동일업종 링크(업종 상세) 텍스트 = 업종명."""
-    a = soup.select_one("a[href*='upjong']")
-    return a.get_text(strip=True) if a else ""
+    if SOURCE == "naver":
+        a = soup.select_one("a[href*='upjong']")
+        return a.get_text(strip=True) if a else ""
+    # FnGuide: 헤더의 'FICS 반도체 및 관련장비' 류 스팬
+    for span in soup.select("span.stxt, p.stxt_group span"):
+        t = span.get_text(" ", strip=True)
+        if t.startswith("FICS"):
+            return t.replace("FICS", "").strip()
+    m = re.search(r"FICS\s*[:\s]\s*([가-힣A-Za-z0-9 ,&·/]+)",
+                  soup.get_text(" ", strip=True))
+    return m.group(1).strip() if m else ""
 
 
 def _extract_target_price(soup: BeautifulSoup):
-    """투자의견 표: <th>투자의견 l 목표주가</th> 옆 <td>의 마지막 숫자 em.
-    '4.00매수' 같은 의견 점수를 목표가로 오인하지 않도록 구조적으로 추출."""
-    for th in soup.find_all("th"):
+    for th in soup.find_all(["th", "dt"]):
         if "목표주가" not in th.get_text():
             continue
-        td = th.find_next("td")
+        td = th.find_next(["td", "dd"])
         if not td:
             continue
         cand = None
-        for em in td.find_all("em"):
+        for em in (td.find_all("em") or [td]):
             v = _clean_num(em.get_text(strip=True))
             if v is not None:
-                cand = v          # 마지막 숫자(목표주가)가 남는다
-        if cand is not None and cand > 100:   # 의견점수(1~5) 배제 안전핀
+                cand = v
+        if cand is not None and cand > 100:
             return cand
     m = re.search(r"목표주가[^0-9]{0,30}?([0-9]{2,3}(?:,[0-9]{3})+)",
                   soup.get_text(" ", strip=True))
@@ -160,13 +171,13 @@ def _extract_target_price(soup: BeautifulSoup):
 
 
 def _find_perf(soup: BeautifulSoup):
-    """기업실적분석 표를 구조 무가정으로 탐지.
-    반환: (기간리스트, 연간열 인덱스 집합, {라벨: 값셀들}) 또는 (None,None,None)"""
+    """(E) 포함 기간 헤더를 가진 재무 표를 구조 무가정으로 탐지 — v6 로직 유지.
+    FnGuide 재무하이라이트: 헤더에 'Annual'/'연간' colspan 행이 있고
+    기간은 '2026/12(E)' 형식이라 그대로 걸린다."""
     for table in soup.find_all("table"):
         trs = table.find_all("tr")
         if len(trs) < 2:
             continue
-        # 1) 기간 헤더 행: 기간 패턴 셀 3개 이상 + (E) 포함 (상단 4행 내)
         p_idx, periods = None, None
         for i, tr in enumerate(trs[:4]):
             texts = _cell_texts(tr)
@@ -176,29 +187,33 @@ def _find_perf(soup: BeautifulSoup):
                 break
         if p_idx is None:
             continue
-        # 2) 라벨 행 수집 (헤더 아래에서 매출액/영업이익)
         rows = {}
         for tr in trs[p_idx + 1:]:
             cells = tr.find_all(["th", "td"])
             if len(cells) < 2:
                 continue
             label = re.sub(r"\s+", "", cells[0].get_text(" ", strip=True))
-            if label in ("매출액", "영업이익") and label not in rows:
-                rows[label] = cells[1:]
+            # FnGuide 라벨은 '매출액', '영업이익' 뒤에 발생주의 수식이 붙을 수 있음
+            base = None
+            if label.startswith("매출액"):
+                base = "매출액"
+            elif label.startswith("영업이익") and "률" not in label and "율" not in label:
+                base = "영업이익"
+            if base and base not in rows:
+                rows[base] = cells[1:]
         if "영업이익" not in rows:
             continue
-        # 3) 기간행 선두의 라벨 칸 제거
         while periods and not PERIOD_RE.search(periods[0]):
             periods = periods[1:]
-        # 4) 연간 열: '연간' colspan 행 우선, 없으면 선행 4열 (네이버 고정 레이아웃)
         ann_idx = set()
         for tr in trs[:p_idx]:
             pos, found = 0, False
             for c in tr.find_all(["th", "td"]):
                 if c.get("rowspan") and not c.get("colspan"):
-                    continue                    # '주요재무정보' 라벨 칸은 열 미점유
+                    continue
                 span = int(c.get("colspan", 1))
-                if "연간" in c.get_text(strip=True):
+                head = c.get_text(strip=True)
+                if "연간" in head or "Annual" in head:
                     ann_idx.update(range(pos, pos + span))
                     found = True
                 pos += span
@@ -211,8 +226,6 @@ def _find_perf(soup: BeautifulSoup):
 
 
 def _annual_estimates(soup: BeautifulSoup) -> dict:
-    """연간 (E) 컬럼에서 매출액/영업이익 추출. 단위: 억원.
-    반환: {("op_e","2026/12"): 820000.0, ...}"""
     out = {}
     periods, ann_idx, rows = _find_perf(soup)
     if not rows:
@@ -235,29 +248,26 @@ def parse(code: str, name: str, html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     wics = _extract_industry(soup)
     rows = []
-
     tp = _extract_target_price(soup)
     if tp is not None:
         rows.append([TODAY, code, name, wics, "target_price", "", tp])
-
     for (metric, period), val in _annual_estimates(soup).items():
         rows.append([TODAY, code, name, wics, metric, period, val])
-
     return rows
 
 
+# ---------------------------------------------------------------- diag
 def _diagnose(req_code: str, html: str):
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(strip=True) if soup.title else "(no title)"
     page = _pagecode(html)
     mismatch = " (불일치)" if page and page != req_code else ""
-    log(f"[diag] 요청코드={req_code} 페이지코드={page or '?'}{mismatch}")
+    log(f"[diag] source={SOURCE} 요청코드={req_code} 페이지코드={page or '?'}{mismatch}")
     log(f"[diag] len={len(html)} title='{title[:60]}' "
         f"tables={len(soup.find_all('table'))}")
 
 
 def _diagnose_perf(html: str):
-    """영업이익E 수집 0일 때: '영업이익' 포함 표들의 헤더 원문 지문 덤프."""
     soup = BeautifulSoup(html, "lxml")
     log("[perf-diag] '영업이익' 포함 테이블 지문:")
     n = 0
@@ -283,7 +293,7 @@ def _diagnose_perf(html: str):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     uni = get_universe_safe()
-    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s (naver)")
+    log(f"[start] {TODAY} 유니버스 {len(uni)}종목, sleep={SLEEP}s ({SOURCE})")
 
     all_rows = []
     n_ok = n_empty = n_fail = n_redirect = n_op = 0
@@ -353,7 +363,8 @@ def main():
 
     n_wics = df.loc[df["wics"] != "", "wics"].nunique()
     log(f"[done] {TODAY}: 성공 {n_ok} (op_e {n_op}) / 컨센없음 {n_empty} "
-        f"/ 리다이렉트 {n_redirect} / 실패 {n_fail} / 총 {len(df)}행 / 업종 {n_wics}개")
+        f"/ 리다이렉트 {n_redirect} / 실패 {n_fail} / 총 {len(df)}행 "
+        f"/ 업종 {n_wics}개 / source={SOURCE}")
 
 
 if __name__ == "__main__":
