@@ -88,12 +88,17 @@ def _referer() -> str:
             else "https://comp.fnguide.com/")
 
 
+_FAIL_DIAG = {"n": 0}
+
+
 def fetch(code: str):
     """반환: (html or None, status ok/redirected/fail)"""
     headers = dict(HEADERS, Referer=_referer())
+    last_reason = "?"
     for _ in range(2):
         try:
             r = requests.get(_url(code), headers=headers, timeout=20)
+            last_reason = f"HTTP {r.status_code} len={len(r.text)}"
             if r.status_code == 200 and len(r.text) > 5000:
                 html = r.text
                 page = _pagecode(html)
@@ -103,9 +108,12 @@ def fetch(code: str):
                 if SOURCE != "naver" and (f"A{code}" in html or code in html):
                     return html, "ok"
                 return html, "redirected"
-        except requests.RequestException:
-            pass
+        except requests.RequestException as e:
+            last_reason = f"{type(e).__name__}: {str(e)[:120]}"
         time.sleep(2)
+    if _FAIL_DIAG["n"] < 3:                       # 처음 3건만 사유 출력
+        _FAIL_DIAG["n"] += 1
+        log(f"[fail-diag] {code}: {last_reason}")
     return None, "fail"
 
 
